@@ -4,112 +4,234 @@ from pyrogram.errors import RPCError, FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 import logging
+
 from .search import clear_redis_for_chat
 from info import AUTHORIZED_USERS
 from utils.database import (
     delete_chat_data_async,
     mark_indexed_chat_async,
     save_movie_async,
-    rebuild_indexes
+    rebuild_indexes,
+    is_source_linked_to_target
 )
 from utils import extract_details
 
 logger = logging.getLogger(__name__)
 
 REINDEXING = {}
+PENDING_DELETE_CONFIRM = {}  # store pending confirmation per user
 BATCH_SIZE = 50
 
 
 @Client.on_message(filters.command("reindex"))
 async def reindex_chat(client, message):
-    """
-    /reindex <target_chat_id> <source_chat_id>
-    Example: /reindex -1001234 -1005678
-    """
     user_id = message.from_user.id
     if user_id not in AUTHORIZED_USERS:
         return
 
+    if REINDEXING.get(user_id):
+        return await message.reply_text("⚠️ Reindexing already running! Please wait or cancel it first.")
+        
     parts = message.text.split()
     if len(parts) < 3:
         return await message.reply_text("Usage: `/reindex target_chat_id source_chat_id`")
 
     target_chat_id = int(parts[1])
     source_chat_id = int(parts[2])
+     
+    if not str(target_chat_id).startswith("-100"):
+        target_chat_id = f"-100{target_chat_id}"
+    if not str(source_chat_id).startswith("-100"):
+        source_chat_id = f"-100{source_chat_id}"
 
     try:
-        bot_member = await client.get_chat_member(target_chat_id, "me")
-    except RPCError as e:
-        return await message.reply_text(f"⚠️ Telegram Error (target): {e}")
+        target_chat_id = int(target_chat_id)
+        source_chat_id = int(source_chat_id)
+    except ValueError:
+        return await message.reply_text("❌ Invalid chat ID. Must be numbers like -1001234567890")
+
+    try:
+        target_chat = await client.get_chat(target_chat_id)
     except Exception as e:
-        return await message.reply_text(f"❌ Unexpected error in target chat: {e}")
-    if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+        return await message.reply_text(f"❌ Cannot access target chat: Make sure bot is admin in target chat.\nError: {e}")
+
+    try:
+        source = await client.get_chat(source_chat_id)
+    except Exception as e:
+        return await message.reply_text(f"❌ Cannot access source chat: Make sure bot is admin in source chat.\nError: {e}")
+
+    if not await is_source_linked_to_target(target_chat_id, source_chat_id):
+        return await message.reply_text("These chats are not indexed. First index using /index command.")
+        
+    async def check_admin(chat_id, who):
+        try:
+            member = await client.get_chat_member(chat_id, who)
+            return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        except Exception:
+            return False
+
+    # 👇 Keeping your permission checks as-is
+    if not await check_admin(target_chat_id, "me"):
         return await message.reply_text("❌ Bot must be admin in target chat!")
 
-    try:
-        user_member = await client.get_chat_member(target_chat_id, user_id)
-    except RPCError as e:
-        return await message.reply_text(f"⚠️ Telegram Error (target user): {e}")
-    except Exception as e:
-        return await message.reply_text(f"❌ Unexpected error checking user in target chat: {e}")
-    if user_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-        return await message.reply_text("❌ You must be admin in target chat to start reindexing!")
+    if not await check_admin(target_chat_id, user_id):
+        return await message.reply_text("❌ You must be admin in target chat!")
 
-    try:
-        bot_member_source = await client.get_chat_member(source_chat_id, "me")
-    except RPCError as e:
-        return await message.reply_text(f"⚠️ Telegram Error (source): {e}")
-    except Exception as e:
-        return await message.reply_text(f"❌ Unexpected error in source chat: {e}")
-    if bot_member_source.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-        return await message.reply_text("❌ Bot must be admin in source chat to fetch messages!")
+    if not await check_admin(source_chat_id, "me"):
+        return await message.reply_text("❌ Bot must be admin in source chat!")
 
     try:
         userbot_member = await client.USER.get_chat_member(source_chat_id, "me")
-    except RPCError as e:
-        return await message.reply_text(f"⚠️ Telegram Error (userbot): {e}")
+        if userbot_member.status not in [
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.MEMBER
+        ]:
+            return await message.reply_text("❌ Userbot must be at least a member in source chat!")
     except Exception as e:
-        return await message.reply_text(f"❌ Userbot can't access source chat: {e}")
-    if userbot_member.status not in [
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.OWNER,
-        ChatMemberStatus.MEMBER
-    ]:
-        return await message.reply_text("❌ Userbot must be at least a member in source chat!")
+        return await message.reply_text(f"⚠️ Userbot can't access source chat: {e}")
+        
+    # Ask for the last message
+    prompt = await message.reply("📩 Forward the last message from the source channel/group or send a message link:")
+    try:
+        user_msg = await client.listen(chat_id=message.chat.id, user_id=message.from_user.id, timeout=120)
+    except asyncio.TimeoutError:
+        await prompt.edit_text("⏳ Timeout. No message received.")
+        return
+    await prompt.delete()
 
-    await message.reply_text(f"🗑️ Deleting old MongoDB and Redis data for `{target_chat_id}`...")
-    deleted_mongo = await delete_chat_data_async(chat_id=target_chat_id)
-    deleted_redis = await clear_redis_for_chat(target_chat_id)
-    await message.reply_text(f"✅ Deleted {deleted_mongo} Mongo docs and {deleted_redis} Redis keys.")
+    last_msg_id = None
+    forward_origin = getattr(user_msg, "forward_origin", None)
+    if forward_origin and getattr(forward_origin, "chat", None):
+        forward_chat = getattr(forward_origin.chat, "sender_chat", None) or forward_origin.chat
+        if forward_chat.id != source_chat_id:
+            return await message.reply_text("❌ Message must be from the same source chat!")
+        last_msg_id = getattr(forward_origin, "message_id", None)
+        if not last_msg_id:
+            return await message.reply("No Message ID Found")
+    elif getattr(user_msg, "text", None) and user_msg.text.startswith("https://t.me"):
+        try:
+            parts = user_msg.text.rstrip("/").split("/")
+            msg_id = int(parts[-1])
+            chat_part = parts[-2]
+            if chat_part.isnumeric():
+                chat_id_from_link = int("-100" + chat_part)
+            else:
+                chat = await client.get_chat(chat_part)
+                chat_id_from_link = chat.id
+
+            if chat_id_from_link != source_chat_id:
+                return await message.reply_text("❌ t.me link must point to the same source chat!")
+
+            last_msg_id = msg_id
+        except Exception:
+            return await message.reply_text("❌ Invalid t.me link format!")
+    else:
+        return await message.reply_text("❌ Invalid input! Must forward a message or provide a t.me link.")
+    
+    # Ask for number of skipped messages
+    s = await message.reply_text("✏️ Enter number of messages to skip from start (0 for none):")
+    try:
+        skip_msg = await client.listen(chat_id=message.chat.id, user_id=user_id, timeout=60)
+    except asyncio.TimeoutError:
+        await s.edit_text("⏳ Timeout. Reindex cancelled.")
+        return
+    await s.delete()
+
+    try:
+        start_msg_id = int(skip_msg.text)
+    except ValueError:
+        return await message.reply_text("❌ Invalid number!")
+        
+    # Ask for delete confirmation — using callback instead of ListenerTypes
+    confirm_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, delete old data", callback_data=f"reindex_confirm_yes_{user_id}"),
+            InlineKeyboardButton("❌ No, keep existing data", callback_data=f"reindex_confirm_no_{user_id}")
+        ]
+    ])
+    ask_delete = await message.reply_text(
+        "🗑️ Do you want to delete old MongoDB and Redis data before reindexing?",
+        reply_markup=confirm_keyboard
+    )
+
+    PENDING_DELETE_CONFIRM[user_id] = {
+        "msg": ask_delete,
+        "target_chat_id": target_chat_id,
+        "source_chat_id": source_chat_id,
+        "start_msg_id": start_msg_id,
+        "last_msg_id": last_msg_id
+    }
+
+
+@Client.on_callback_query(filters.regex(r"reindex_confirm_(yes|no)_(\d+)"))
+async def handle_delete_confirm(client, callback_query):
+    choice, user_id = callback_query.matches[0].group(1), int(callback_query.matches[0].group(2))
+    if user_id not in PENDING_DELETE_CONFIRM:
+        return await callback_query.answer("⚠️ No pending reindex found!", show_alert=True)
+
+    ctx = PENDING_DELETE_CONFIRM.pop(user_id)
+    msg = ctx["msg"]
+    await msg.delete()
+
+    delete_old_data = choice == "yes"
+    if delete_old_data:
+        await callback_query.answer("🗑️ Old data will be deleted.", show_alert=False)
+    else:
+        await callback_query.answer("✅ Keeping existing data.", show_alert=False)
+
+    # Now call the actual reindex routine
+    await start_reindex(
+        client,
+        callback_query.message,
+        user_id,
+        ctx["target_chat_id"],
+        ctx["source_chat_id"],
+        ctx["start_msg_id"],
+        ctx["last_msg_id"],
+        delete_old_data
+    )
+
+
+async def start_reindex(client, message, user_id, target_chat_id, source_chat_id, start_msg_id, last_msg_id, delete_old_data):
+    if delete_old_data:
+        await message.reply_text(f"🗑️ Deleting old MongoDB and Redis data for `{target_chat_id}`...")
+        deleted_mongo = await delete_chat_data_async(chat_id=target_chat_id)
+        deleted_redis = await clear_redis_for_chat(target_chat_id)
+        await message.reply_text(f"✅ Deleted {deleted_mongo} Mongo docs and {deleted_redis} Redis keys.")
+    else:
+        await message.reply_text("✅ Skipped data deletion. Existing entries will remain intact.")
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_reindex_{user_id}")]
     ])
+
     progress = await message.reply_text(
         f"♻️ Reindexing started...\nFrom `{source_chat_id}` → `{target_chat_id}`",
         reply_markup=keyboard
     )
 
     REINDEXING[user_id] = True
+
     indexed = 0
+    duplicates = 0
     errors = 0
     unsupported = 0
-    count = 0
+
     try:
         async for msg in client.USER.search_messages(
             source_chat_id,
-            filter=MessagesFilter.EMPTY,  # Fetch all messages
+            filter=MessagesFilter.EMPTY,
             offset=0
         ):
             if not REINDEXING.get(user_id):
                 await progress.edit_text("🚫 Indexing cancelled.")
                 return
-                
-            if not msg.media:
-                unsupported += 1
+
+            if msg.id < start_msg_id or msg.id > last_msg_id:
                 continue
-                
-            if msg.media not in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
+
+            if not msg.media or msg.media not in [MessageMediaType.VIDEO, MessageMediaType.DOCUMENT]:
                 unsupported += 1
                 continue
 
@@ -117,14 +239,19 @@ async def reindex_chat(client, message):
                 msg.caption
                 or getattr(msg.video, "file_name", None)
                 or getattr(msg.document, "file_name", None)
-            )   
+            )
             if not msg_caption:
                 unsupported += 1
                 continue
 
+            file_uid = (
+                getattr(msg.video, "file_unique_id", None)
+                or getattr(msg.document, "file_unique_id", None)
+            )
+
             try:
                 details = extract_details(msg_caption)
-                await save_movie_async(
+                result = await save_movie_async(
                     chat_id=target_chat_id,
                     title=details.get("title"),
                     year=details.get("year"),
@@ -135,39 +262,51 @@ async def reindex_chat(client, message):
                     episode=details.get("episode"),
                     codec=details.get("codec"),
                     caption=msg_caption,
-                    link=msg.link
+                    link=msg.link,
+                    file_unique_id=file_uid
                 )
-                indexed += 1
-                if indexed % BATCH_SIZE == 0:
+
+                if result == "saved":
+                    indexed += 1
+                elif result == "duplicate":
+                    duplicates += 1
+                else:
+                    errors += 1
+
+                total = indexed + duplicates
+                if total % BATCH_SIZE == 0:
                     await asyncio.sleep(2)
                     await progress.edit_text(
-                        f"📈 Reindexing...\nIndexed: {indexed}\nUnsupported: {unsupported}\n⚠️ Failed: {errors}\n"
+                        f"📈 Reindexing Progress\n"
+                        f"✅ Indexed: {indexed}\n"
+                        f"⏩ Duplicates: {duplicates}\n"
+                        f"⚠️ Unsupported: {unsupported}\n"
+                        f"❌ Failed: {errors}\n"
                         f"From `{source_chat_id}` → `{target_chat_id}`",
                         reply_markup=keyboard
                     )
+
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value)
             except Exception as inner_e:
                 errors += 1
-                logger.info(f"⚠️ Skipped: {inner_e}")
+                logger.warning(f"⚠️ Skipped message due to error: {inner_e}")
 
         await rebuild_indexes()
         await mark_indexed_chat_async(target_chat_id, source_chat_id)
 
         await progress.edit_text(
             f"✅ Reindex Completed!\n\n"
-            f"📂 Indexed: {indexed}\n⚠️ Unsupported: {unsupported}\n❌ Failed: {errors}\n"
+            f"📂 Indexed: {indexed}\n"
+            f"⏩ Duplicates: {duplicates}\n"
+            f"⚠️ Unsupported: {unsupported}\n"
+            f"❌ Failed: {errors}\n"
             f"🔗 `{source_chat_id}` → `{target_chat_id}`"
         )
 
     except Exception as e:
         await progress.edit_text(f"❌ Error during reindex: {e}")
         logger.exception(e)
+
     finally:
         REINDEXING.pop(user_id, None)
-
-
-@Client.on_callback_query(filters.regex(r"cancel_reindex_(\d+)"))
-async def cancel_reindex_callback(client, callback_query):
-    user_id = int(callback_query.matches[0].group(1))
-    REINDEXING[user_id] = False
-    await callback_query.answer("Cancelled!", show_alert=True)
-    await callback_query.message.edit_text("🚫 Indexing cancelled.")

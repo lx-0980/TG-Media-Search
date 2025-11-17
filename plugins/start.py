@@ -1,9 +1,11 @@
+import os
 import time
 import humanize
+import asyncio
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import RPCError
-from utils.database import collection, ensure_indexes, INDEXED_COLL
+from utils.database import collection, ensure_indexes, INDEXED_COLL, RESTART_COLL, add_restart_message
 from redis.exceptions import ConnectionError as RedisConnectionError
 from motor.motor_asyncio import AsyncIOMotorClient
 from .search import rdb, clear_redis_for_chat
@@ -19,26 +21,34 @@ async def start_command(client, message):
         return
         
     text = (
-        "👋 <b>Welcome to Wroxen Bot!</b>\n\n"
-        "Here’s how to use me:\n"
-        "━━━━━━━━━━━━━━━\n"
-        "🧩 <b>1. Index Source Chats:</b>\n"
-        "Use <code>/index &lt;target_chat_id&gt; &lt;source_chat_id&gt;</code>\n"
-        "to link a group with a source channel.\n\n"
-        "🗑 <b>2. Delete Indexed Data:</b>\n"
-        "Use <code>/delete &lt;target_chat_id&gt; &lt;source_chat_id&gt;</code> to unlink.\n\n"
-        "🔍 <b>3. Search:</b>\n"
-        "Simply send a movie name in your group to search.\n\n"
-        "🧹 <b>Utility Commands:</b>\n"
-        "<code>/resetdb</code> - Clean MongoDB database\n"
-        "<code>/reindex</code> - Reindex chat messages\n"
-        "<code>/clearcache</code> - Clear Redis cache for a specific chat\n"
-        "<code>/flushredis</code> - ⚠️ Clear entire Redis database (use with caution)\n\n"
-        "⚙️ <b>Notes:</b>\n"
-        "• Bot only works in authorized and linked chats.\n"
-        "• Use <code>/checkbot</code> to check MongoDB & Redis status.\n"
-        "• Userbot must be admin in source channel; new posts are saved automatically.\n"
-        "• Avoid rapid button clicks to prevent FloodWaits."
+        "✨ <b>Welcome to <u>Wroxen Bot</u>!</b>\n\n"
+        "<b>How to Use Me</b>\n"
+        "<b>1. Index Source Chats:</b>\n"
+        "→ <code>/index &lt;target_chat_id&gt; &lt;source_chat_id&gt;</code>\n"
+        "   Link your group with a source channel.\n\n"
+
+        "<b>2. Delete Indexed Data:</b>\n"
+        "→ <code>/delete &lt;target_chat_id&gt; &lt;source_chat_id&gt;</code>\n"
+        "   Unlink a group and source channel.\n\n"
+
+        "<b>3. Search Movies or Series:</b>\n"
+        "→ Just send a movie name in your linked group.\n"
+        "   I’ll fetch results instantly!\n\n"
+
+        "<b>Utility Commands</b>\n"
+        "<code>/resetdb</code> – Clean MongoDB database\n"
+        "<code>/reindex</code> – Reindex all chat messages\n"
+        "<code>/clearcache</code> – Clear Redis cache (specific chat)\n"
+        "<code>/restart</code> – Pull latest commits & restart bot\n"
+        "<code>/flushredis</code> – Clear <b>entire</b> Redis database\n\n"
+
+        "<b>Important Notes</b>\n"
+        "• Works only in <b>authorized & linked</b> chats\n"
+        "• Use <code>/checkbot</code> to verify MongoDB & Redis health\n"
+        "• Userbot must be admin in the source channel\n"
+        "• Avoid rapid button clicks to prevent FloodWaits\n\n"
+
+        "💡 <i>Tip:</i> Stay organized — keep your chats clean and synced effortlessly!"
     )
 
     buttons = InlineKeyboardMarkup([
@@ -126,7 +136,8 @@ async def resetdb_handler(client, message):
             return await message.reply("❌ Reset cancelled.")
         msg = await message.reply("🧹 Resetting database... please wait.")
         await collection.drop()            
-        await INDEXED_COLL.drop()  
+        await INDEXED_COLL.drop()
+        await RESTART_COLL.drop()
         await ensure_indexes()
         await rdb.flushdb()
         await msg.edit_text("✅ Database reset successfully!\nAll data wiped and indexes rebuilt.")
@@ -135,6 +146,22 @@ async def resetdb_handler(client, message):
     except Exception as e:
         logger.exception("❌ Database reset failed")
         await message.reply_text(f"❌ Reset failed: {e}")
+
+
+@Client.on_message(filters.command("restart") & filters.user(AUTHORIZED_USERS))
+async def restart_bot(client, message):
+    """Restart bot using bash script (updates + relaunches)."""
+    msg = await message.reply_text("♻️ Restarting bot, please wait...")
+    try:
+        await add_restart_message(msg.id, message.chat.id)
+    except Exception:
+        pass
+
+    await asyncio.sleep(2)
+    try:
+        os.execv("/bin/bash", ["bash", "start.sh"])
+    except Exception as e:
+        await message.reply_text(f"❌ Failed to restart: {e}")
         
 @Client.on_message(filters.command("checkbot") & filters.private)
 async def checkbot_handler(client, message):
