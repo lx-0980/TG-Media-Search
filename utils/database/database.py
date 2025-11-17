@@ -13,6 +13,9 @@ client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 INDEXED_COLL = db["indexed_chats"]
+RESTART_COLL = db["restart_info"]
+
+
 
 async def drop_existing_indexes():
     """Drop all existing indexes safely."""
@@ -45,6 +48,13 @@ async def ensure_indexes():
 
         for field in ["chat_id", "quality", "lang", "print", "season", "episode", "codec"]:
             await collection.create_index(field, background=True)
+
+        await collection.create_index(
+            [("chat_id", 1), ("file_unique_id", 1)],
+            unique=True,
+            background=True,
+            name="unique_file_per_chat"
+        )
 
         await INDEXED_COLL.create_index("target_chat", background=True)
         await INDEXED_COLL.create_index("source_chat", background=True)
@@ -90,11 +100,25 @@ def _safe_int(value):
 async def save_movie_async(chat_id: int, title: str = None, year: int = None,
                            quality: str = None, lang: str = None, print_type: str = None,
                            season=None, episode=None, codec: str = None,
-                           caption: str = None, link: str = None):
-    """Save a single movie entry."""
+                           caption: str = None, link: str = None,
+                           file_unique_id: str = None):
+
     try:
+        if not file_unique_id:
+            logger.warning("⚠️ Skipped: Missing file_unique_id.")
+            return "error"
+
+        existing = await collection.find_one({
+            "chat_id": int(chat_id),
+            "file_unique_id": file_unique_id
+        })
+        if existing:
+            logger.info(f"⏩ Duplicate skipped ({file_unique_id}) in chat {chat_id}")
+            return "duplicate"
+
         doc = {
             "chat_id": int(chat_id),
+            "file_unique_id": file_unique_id,
             "title": title.strip() if title else None,
             "year": int(year) if year else None,
             "quality": quality,
@@ -108,12 +132,16 @@ async def save_movie_async(chat_id: int, title: str = None, year: int = None,
         }
 
         clean_doc = {k: v for k, v in doc.items() if v is not None}
-        result = await collection.insert_one(clean_doc)
+        await collection.insert_one(clean_doc)
         logger.info(f"✅ Saved: {title or 'Untitled'} ({chat_id})")
-        return str(result.inserted_id)
-    except Exception:
+        return "saved"
+
+    except Exception as e:
+        if "duplicate key error" in str(e).lower():
+            logger.info(f"⚠️ Duplicate prevented for {file_unique_id}")
+            return "duplicate"
         logger.exception("❌ save_movie_async failed")
-        return None
+        return "error"
 
 
 async def delete_chat_data_async(chat_id: int):
@@ -228,7 +256,18 @@ async def unmark_indexed_chat_async(target_chat: int, source_chat: int = None):
         logger.exception("unmark_indexed_chat_async failed")
 
 
-async def get_targets_for_source_async(source_chat: int):
+async def is_source_linked_to_target(target_chat: int, source_chat: int):
+    try:
+        doc = await INDEXED_COLL.find_one(
+            {"target_chat": target_chat, "source_chat": source_chat},
+            {"_id": 1}
+        )
+        return bool(doc)
+    except Exception as e:
+        logger.exception("get_sources_for_target_async failed")
+        return False
+
+async def is_source_in_db(source_chat: int) -> bool:
     """Get all targets linked to a source."""
     try:
         docs = await INDEXED_COLL.find(
@@ -236,22 +275,9 @@ async def get_targets_for_source_async(source_chat: int):
         ).to_list(length=None)
         return [d["target_chat"] for d in docs]
     except Exception:
-        logger.exception("get_targets_for_source_async failed")
+        logger.exception("is_source_in_db failed")
         return []
-
-
-async def get_sources_for_target_async(target_chat: int):
-    """Get all sources linked to a target."""
-    try:
-        docs = await INDEXED_COLL.find(
-            {"target_chat": target_chat}, {"source_chat": 1}
-        ).to_list(length=None)
-        return [d["source_chat"] for d in docs]
-    except Exception:
-        logger.exception("get_sources_for_target_async failed")
-        return []
-
-
+        
 async def is_chat_linked_async(target_chat: int) -> bool:
     """Check if target chat is already linked."""
     try:
@@ -260,3 +286,33 @@ async def is_chat_linked_async(target_chat: int) -> bool:
     except Exception:
         logger.exception("is_chat_linked_async failed")
         return False
+
+# Restart Function
+
+async def add_restart_message(msg_id: int, chat_id: int):
+    """Save the restart message reference."""
+    try:
+        await RESTART_COLL.delete_many({})
+        await RESTART_COLL.insert_one({"msg_id": msg_id, "chat_id": chat_id})
+        logger.info(f"💾 Restart message saved → chat={chat_id}, msg={msg_id}")
+    except Exception as e:
+        logger.exception(f"add_restart_message failed: {e}")
+
+
+async def get_restart_message():
+    """Return stored restart message (chat_id, msg_id) if any."""
+    try:
+        data = await RESTART_COLL.find_one()
+        if data:
+            return data["chat_id"], data["msg_id"]
+    except Exception as e:
+        logger.exception(f"get_restart_message failed: {e}")
+    return None, None
+
+
+async def clear_restart_message():
+    """Clear restart record after confirming restart."""
+    try:
+        await RESTART_COLL.delete_many({})
+    except Exception as e:
+        logger.exception(f"clear_restart_message failed: {e}")

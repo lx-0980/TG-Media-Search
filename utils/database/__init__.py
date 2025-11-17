@@ -5,10 +5,14 @@ from .database import (
     ensure_indexes, 
     mark_indexed_chat_async, 
     unmark_indexed_chat_async, 
-    get_targets_for_source_async, 
-    get_sources_for_target_async,
+    is_source_linked_to_target, 
+    is_source_in_db,
     collection, 
     is_chat_linked_async, 
     INDEXED_COLL,
-    rebuild_indexes
+    rebuild_indexes, 
+    add_restart_message, 
+    get_restart_message, 
+    clear_restart_message, 
+    RESTART_COLL
 )      
